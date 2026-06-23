@@ -24,7 +24,7 @@ FDI and PCI each independently explain a substantial share of cross-provincial i
 
 ## How to Run
 
-1. Open `replication_code.py` in Google Colab.
+1. Open `Reproducible Code.py` in Google Colab.
 2. Run the import cell first. The script expects the following packages: pandas, numpy, matplotlib, scipy, statsmodels, scikit-learn, linearmodels. Install linearmodels if not already available (`pip install linearmodels`).
 3. Run the script. It will prompt a file upload dialog through `google.colab.files.upload()`.
 4. Upload the following Excel files when prompted, matching the keys used in `FILE_CONFIG`: population and area, enterprise, FDI, geographic advantage, GRDP per capita, labor productivity, PCI score, literacy rate, trained labor share, unemployment rate, out-migration rate, in-migration rate, SCOLI, and state investment.
