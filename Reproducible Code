@@ -25,6 +25,34 @@ YEARS = list(range(2018, 2025))
 
 
 # Data loading utilities
+KEY_HINTS = {
+    'pop_area':   'Dân số_Mật',
+    'enterprise': 'enterprise',
+    'fdi':        'FDI',
+    'geo':        'Geo_',
+    'grdp':       'grdp',
+    'labprod':    'Năng suất',
+    'pci':        'pci score',
+    'grdppc':     'bình quân đầu người',
+    'literacy':   'biết chữ',
+    'trained':    'qua đào tạo',
+    'unemp':      'thất nghiệp',
+    'outmig':     'di cư',
+    'inmig':      'nhập cư',
+    'scoli':      'scoli',
+    'state_inv':  'khu vực kinh tế Nhà nước',
+}
+
+print("Upload all 15 Excel files:")
+uploaded = files.upload()
+print(f"{len(uploaded)} files received.")
+
+FILE_CONFIG = {}
+for key, hint in KEY_HINTS.items():
+    candidates = [k for k in uploaded.keys() if hint.lower() in k.lower()]
+    FILE_CONFIG[key] = candidates[0] if candidates else list(uploaded.keys())[0]
+    print(f"  [{key:14s}] -> {FILE_CONFIG[key]}")
+
 def safe_float(val):
     if pd.isna(val): return np.nan
     if isinstance(val, (int, float)): return float(val)
@@ -104,7 +132,7 @@ def load_fdi_long():
             .reset_index(drop=True))
 
 def load_scoli():
-    # Parses SCOLI in either province-by-year (A), cross-section (C), or year-by-province (B) layout
+    # Handles province-by-year (A), cross-section (C), or year-by-province (B) layouts
     df = read_xlsx('scoli')
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -222,8 +250,7 @@ def load_state_invest():
 
 
 # Load and merge panel
-uploaded = files.upload()
-
+print("\nLoading data files...")
 area_df, pop_long, density_long = load_pop_area()
 df_enterprise = wide_to_long('enterprise', 'enterprise')
 df_fdi        = load_fdi_long()
@@ -238,6 +265,7 @@ df_outmig     = wide_to_long('outmig', 'outmig')
 df_inmig      = wide_to_long('inmig', 'inmig')
 df_scoli      = load_scoli()
 df_state_inv, inv_level = load_state_invest()
+print("All files loaded.")
 
 df_geo['geo_luck'] = (df_geo['port_access'] + df_geo['coastal'] * 100 + df_geo['border'] * 100) / 3.0
 geo_mat = df_geo[['port_access', 'coastal', 'border']].dropna()
@@ -266,6 +294,9 @@ if inv_level == 'provincial':
     panel = panel.merge(df_state_inv[['province', 'year', 'state_inv']], on=['province', 'year'], how='left')
 else:
     panel = panel.merge(df_state_inv[['year', 'state_inv_nat']], on='year', how='left')
+
+print(f"Panel merged: {panel.shape[0]} obs x {panel.shape[1]} cols")
+
 
 # Variable construction
 panel = panel.sort_values(['province', 'year']).reset_index(drop=True)
@@ -298,13 +329,13 @@ fdi_rn = panel.groupby(['region', 'year'])['fdi'].transform('count')
 panel['fdi_loo']     = (fdi_rt - panel['fdi']) / (fdi_rn - 1)
 panel['fdi_loo_ihs'] = np.arcsinh(panel['fdi_loo'])
 
-# Placebo instrument: mean FDI of provinces in other regions (exclusion-restriction check)
+# Placebo instrument: mean FDI of provinces in other regions, used to test the exclusion restriction
 fdi_national_sum = panel.groupby('year')['fdi'].transform('sum')
 fdi_national_n   = panel.groupby('year')['fdi'].transform('count')
 panel['fdi_placebo_raw'] = (fdi_national_sum - fdi_rt) / (fdi_national_n - fdi_rn)
 panel['fdi_placebo_ihs'] = np.arcsinh(panel['fdi_placebo_raw'])
 
-# SCOLI adjustment: real GRDPpc = nominal / (SCOLI/100), missing filled by region then national median
+# SCOLI adjustment: real GRDPpc = nominal / (SCOLI/100); missing filled by region then national median
 reg_scoli = panel.groupby(['region', 'year'])['scoli'].transform(lambda x: x.fillna(x.median()))
 panel['scoli_filled'] = panel['scoli'].fillna(reg_scoli)
 nat_scoli = panel.groupby('year')['scoli'].transform(lambda x: x.fillna(x.median()))
@@ -318,6 +349,8 @@ if inv_level == 'provincial':
 else:
     panel['state_inv_nat_ln'] = np.log(panel['state_inv_nat'].clip(lower=1))
     STATE_INV_COL = 'state_inv_nat_ln'
+
+print(f"SCOLI factor range: {(panel['scoli_filled']/100).min():.3f} to {(panel['scoli_filled']/100).max():.3f}")
 
 
 # Estimation sample and variable sets
@@ -351,6 +384,7 @@ if len(panel_est) < 200:
                  .copy().sort_values(['province', 'year']))
 
 N_obs, N_prov, N_yr = len(panel_est), panel_est['province'].nunique(), panel_est['year'].nunique()
+print(f"Estimation sample: {N_obs} obs, {N_prov} provinces, {N_yr} years. Active DV: {DV}")
 
 panel_idx = panel_est.set_index(['province', 'year'])
 yr_d = pd.get_dummies(panel_idx.index.get_level_values('year'), prefix='yr', drop_first=True).astype(float)
@@ -363,7 +397,8 @@ def stars(p):
 def fmt(b, p, dec=4):
     return '-' if pd.isna(b) else f"{b:.{dec}f}{stars(p)}"
 
-# Sequential OLS / Two-way FE
+
+# Sequential OLS/Two-way FE
 seq_specs = {
     '(1)': f'{DV} ~ {LUCK} + C(year)',
     '(2)': f'{DV} ~ {LUCK} + {GEO_CTL} + C(year)',
@@ -375,7 +410,6 @@ seq_fits = {name: smf.ols(f, data=panel_est).fit(
     cov_type='cluster', cov_kwds={'groups': panel_est['province']}
 ) for name, f in seq_specs.items()}
 
-# Hausman test (FE vs RE)
 exog_re = sm.add_constant(to_f(pd.concat([panel_idx[[LUCK, TALENT, GEO_CTL] + CONTROLS_LM], yr_d], axis=1)))
 exog_fe = sm.add_constant(to_f(pd.concat([panel_idx[[LUCK, TALENT] + CONTROLS_LM], yr_d], axis=1)))
 try:
@@ -469,7 +503,6 @@ for i, v in enumerate(bar_vars_present):
 ft = m_cre.f_test(R)
 F_mund, p_mund = float(ft.fvalue), float(ft.pvalue)
 
-# Between estimator
 df_be = panel_est.groupby('province')[[DV, LUCK, TALENT, GEO_CTL] + CONTROLS_LM].mean().reset_index()
 m_be = smf.ols(f'{DV} ~ {LUCK} + {TALENT} + {GEO_CTL} + {" + ".join(CONTROLS_LM)}',
                data=df_be).fit(cov_type='HC1')
@@ -477,15 +510,14 @@ b_fdi_be, p_fdi_be = m_be.params.get(LUCK, np.nan), m_be.pvalues.get(LUCK, np.na
 b_pci_be, p_pci_be = m_be.params.get(TALENT, np.nan), m_be.pvalues.get(TALENT, np.nan)
 
 
-# Spatial heterogeneity: split sample and pooled interaction (H4)
+# Spatial heterogeneity
 coast_est  = panel_est[panel_est['coastal'] == 1]
 inland_est = panel_est[panel_est['coastal'] == 0]
 m_coast  = smf.ols(base_f, data=coast_est).fit(cov_type='cluster', cov_kwds={'groups': coast_est['province']})
 m_inland = smf.ols(base_f, data=inland_est).fit(cov_type='cluster', cov_kwds={'groups': inland_est['province']})
-b_coast_pci, p_coast_pci = m_coast.params.get(TALENT, np.nan), m_coast.pvalues.get(TALENT, np.nan)
+b_coast_pci, p_coast_pci   = m_coast.params.get(TALENT, np.nan), m_coast.pvalues.get(TALENT, np.nan)
 b_inland_pci, p_inland_pci = m_inland.params.get(TALENT, np.nan), m_inland.pvalues.get(TALENT, np.nan)
 
-# Pooled interaction is the preferred H4 test: full sample, single coefficient and SE
 panel_int = panel_est.copy()
 panel_int['coastal_x_pci'] = panel_int['coastal'] * panel_int[TALENT]
 panel_int['coastal_x_fdi'] = panel_int['coastal'] * panel_int[LUCK]
@@ -496,11 +528,15 @@ b_cxp, se_cxp, p_cxp = (m_int1.params.get('coastal_x_pci', np.nan),
                         m_int1.bse.get('coastal_x_pci', np.nan),
                         m_int1.pvalues.get('coastal_x_pci', np.nan))
 b_pci_int1, p_pci_int1 = m_int1.params.get(TALENT, np.nan), m_int1.pvalues.get(TALENT, np.nan)
+ci_cxp_low, ci_cxp_high = (b_cxp - 1.96 * se_cxp, b_cxp + 1.96 * se_cxp) if not np.isnan(b_cxp) else (np.nan, np.nan)
 b_pci_inland_implied  = b_pci_int1
 b_pci_coastal_implied = b_pci_int1 + b_cxp if not np.isnan(b_cxp) else np.nan
 
 f_int2 = f'{DV} ~ {LUCK} + {TALENT} + coastal_x_pci + coastal_x_fdi + {GEO_CTL} + {ctrl_str} + C(year)'
 m_int2 = smf.ols(f_int2, data=panel_int).fit(cov_type='cluster', cov_kwds={'groups': panel_int['province']})
+
+f_int3 = f'{DV} ~ {LUCK} + {TALENT} + coastal_x_pci + {ctrl_str} + C(year) + C(province)'
+m_int3 = smf.ols(f_int3, data=panel_int).fit(cov_type='cluster', cov_kwds={'groups': panel_int['province']})
 
 
 # LOO exclusion restriction diagnostics
@@ -519,12 +555,35 @@ F_plac, p_plac_coef = fs_plac.fvalue, fs_plac.pvalues.get(PLACEBO, np.nan)
 fs_both_X = sm.add_constant(to_f(pd.concat([panel_plac_idx[[INSTR, PLACEBO, TALENT, GEO_CTL] + CONTROLS_LM], yr_d_plac], axis=1)))
 fs_both = sm.OLS(panel_plac_idx[LUCK].astype(float), fs_both_X).fit(cov_type='HC1')
 p_plac_in_both = fs_both.pvalues.get(PLACEBO, np.nan)
+b_plac_in_both = fs_both.params.get(PLACEBO, np.nan)
 
-# Cross-sectional dependence by region (pooled, used as exclusion-restriction check)
+# Cross-sectional dependence by region, used as an additional exclusion-restriction check
 panel_est_cd = panel_est.copy()
 panel_est_cd['fe_resid'] = smf.ols(
     f'{DV} ~ {LUCK} + {TALENT} + {GEO_CTL} + {ctrl_str} + C(year) + C(province)',
     data=panel_est_cd).fit().resid.values
+
+cd_by_region = {}
+for reg, grp in panel_est_cd.groupby('region'):
+    provs = sorted(grp['province'].unique())
+    n_p = len(provs)
+    if n_p < 3:
+        cd_by_region[reg] = (np.nan, np.nan, n_p)
+        continue
+    T_r, rho_s, count = grp['year'].nunique(), 0, 0
+    for ii in range(n_p):
+        for jj in range(ii + 1, n_p):
+            ri = grp[grp['province'] == provs[ii]]['fe_resid'].values
+            rj = grp[grp['province'] == provs[jj]]['fe_resid'].values
+            mt = min(len(ri), len(rj))
+            if mt > 1:
+                rij = np.corrcoef(ri[:mt], rj[:mt])[0, 1]
+                if not np.isnan(rij): rho_s += rij; count += 1
+    if count > 0:
+        cd_s = np.sqrt(2 * T_r / (n_p * (n_p - 1))) * rho_s
+        cd_by_region[reg] = (cd_s, 2 * (1 - norm.cdf(abs(cd_s))), n_p)
+    else:
+        cd_by_region[reg] = (np.nan, np.nan, n_p)
 
 prov_list_all = sorted(panel_est_cd['province'].unique())
 N_all, T_all = len(prov_list_all), panel_est_cd['year'].nunique()
@@ -540,7 +599,7 @@ for ii in range(N_all):
 CD_pool = np.sqrt(2 * T_all / (N_all * (N_all - 1))) * rho_sum_all
 CD_pool_p = 2 * (1 - norm.cdf(abs(CD_pool)))
 
-# Year x region FE saturation: tests whether LOO is absorbing region-year shocks
+# Year x region FE saturation: tests whether LOO is absorbing region-year common shocks
 panel_est_yr = panel_est.copy()
 panel_est_yr['yr_reg'] = panel_est_yr['year'].astype(str) + '_' + panel_est_yr['region']
 f_yrfe = f'{DV} ~ {LUCK} + {TALENT} + {GEO_CTL} + {ctrl_str} + C(yr_reg) + C(province)'
@@ -550,16 +609,21 @@ b_pci_yrfe, p_pci_yrfe = m_yrfe.params.get(TALENT, np.nan), m_yrfe.pvalues.get(T
 
 
 # Robustness checks
+controls_no_mig = [c for c in CONTROLS if c not in ['netmig', 'lnenterprise']]
+f_r8 = f'{DV} ~ {LUCK} + {TALENT} + {GEO_CTL} + {" + ".join(controls_no_mig)} + C(year)'
+
 rob_specs = {
-    'R0: Baseline (SCOLI-adj)': (base_f, panel_est),
-    'R1: Nominal DV':           (base_f.replace(DV, DV_NOM), panel_est),
-    'R2: PCA geo_luck':         (base_f.replace('geo_luck', 'geo_luck_pca'),
-                                 panel_est.dropna(subset=['geo_luck_pca'])),
-    'R3: Excl FDI outliers':    (base_f, panel_est[panel_est['fdi_outlier'] == 0]),
-    'R4: Coastal only':         (base_f, panel_est[panel_est['coastal'] == 1]),
-    'R5: Inland only':          (base_f, panel_est[panel_est['coastal'] == 0]),
-    'R6: + literacy':           (base_f + ' + literacy', panel_est.dropna(subset=['literacy'])),
-    'R7: Alt FDI ln(x+1)':      (base_f.replace('fdi_ihs', 'lfdi'), panel_est.dropna(subset=['lfdi'])),
+    'R0: Baseline (SCOLI-adj)':       (base_f, panel_est),
+    'R1: Nominal DV':                 (base_f.replace(DV, DV_NOM), panel_est),
+    'R2: PCA geo_luck':                (base_f.replace('geo_luck', 'geo_luck_pca'),
+                                        panel_est.dropna(subset=['geo_luck_pca'])),
+    'R3: Excl FDI outliers':           (base_f, panel_est[panel_est['fdi_outlier'] == 0]),
+    'R4: Coastal only':                (base_f, panel_est[panel_est['coastal'] == 1]),
+    'R5: Inland only':                 (base_f, panel_est[panel_est['coastal'] == 0]),
+    'R6: + literacy':                  (base_f + ' + literacy', panel_est.dropna(subset=['literacy'])),
+    'R7: Alt FDI ln(x+1)':            (base_f.replace('fdi_ihs', 'lfdi'), panel_est.dropna(subset=['lfdi'])),
+    'R8: Excl NetMig, Enterprises':    (f_r8, panel_est),
+    'R9: Excl 2020-2021 (COVID)':      (base_f, panel_est[~panel_est['year'].isin([2020, 2021])]),
 }
 rob_records = []
 for name, (formula, data) in rob_specs.items():
@@ -569,7 +633,6 @@ for name, (formula, data) in rob_specs.items():
                          'PCI_b': m.params.get(TALENT, np.nan), 'PCI_p': m.pvalues.get(TALENT, np.nan),
                          'R2': m.rsquared_adj, 'N': int(m.nobs)})
 rob_df = pd.DataFrame(rob_records).round(4)
-
 
 # Additional diagnostics
 fs_data = panel_est.dropna(subset=[DV, LUCK, INSTR, TALENT, GEO_CTL] + CONTROLS).copy()
@@ -646,29 +709,39 @@ print(f"  {'Two-way FE (within)':<22} "
       f"{fmt(seq_fits['(5)'].params.get(LUCK,np.nan), seq_fits['(5)'].pvalues.get(LUCK,np.nan)):>12} "
       f"{fmt(seq_fits['(5)'].params.get(TALENT,np.nan), seq_fits['(5)'].pvalues.get(TALENT,np.nan)):>12} {N_obs:>6}")
 
-print(f"\nTable 7. Spatial heterogeneity, split sample")
+print(f"\nTable 7. Spatial heterogeneity, split sample (comparison only)")
 print(f"  Coastal (N={int(m_coast.nobs)})  PCI={fmt(b_coast_pci, p_coast_pci)}")
 print(f"  Inland  (N={int(m_inland.nobs)}) PCI={fmt(b_inland_pci, p_inland_pci)}")
 
-print(f"\nTable 8. H4 pooled interaction test")
-print(f"  Coastal x PCI = {fmt(b_cxp, p_cxp)}  se=({se_cxp:.4f})")
+print(f"\nTable 8. H4 pooled interaction test (preferred specification, full sample)")
+print(f"  Coastal x PCI = {fmt(b_cxp, p_cxp)}  se=({se_cxp:.4f})  95% CI [{ci_cxp_low:.4f}, {ci_cxp_high:.4f}]")
 print(f"  Implied inland beta  = {b_pci_inland_implied:.4f}")
 print(f"  Implied coastal beta = {b_pci_coastal_implied:.4f}")
+print(f"  No statistically significant evidence of spatial heterogeneity was found.")
+print(f"  The confidence interval includes effect sizes that would be substantively")
+print(f"  meaningful, so this should be read as an inconclusive result given current")
+print(f"  power, not as definitive evidence that returns are equal.")
 print(f"  Full interaction model: coastal x PCI = "
       f"{fmt(m_int2.params.get('coastal_x_pci', np.nan), m_int2.pvalues.get('coastal_x_pci', np.nan))}, "
       f"coastal x FDI = {fmt(m_int2.params.get('coastal_x_fdi', np.nan), m_int2.pvalues.get('coastal_x_fdi', np.nan))}")
+print(f"  Province + year FE specification: coastal x PCI (within) = "
+      f"{fmt(m_int3.params.get('coastal_x_pci', np.nan), m_int3.pvalues.get('coastal_x_pci', np.nan))}")
 
 print(f"\nTable 9. LOO exclusion restriction diagnostics")
 print(f"  Real LOO first-stage F    = {F_real:.2f}")
 print(f"  Placebo first-stage F     = {F_plac:.2f}")
-print(f"  Placebo coef, both incl.  = {fmt(b_plac_in_both := fs_both.params.get(PLACEBO, np.nan), p_plac_in_both)}")
+print(f"  Placebo coef, both incl.  = {fmt(b_plac_in_both, p_plac_in_both)}")
 print(f"  Pooled Pesaran CD p       = {CD_pool_p:.4f}")
+for reg in sorted(cd_by_region.keys()):
+    cs, cp, n_ = cd_by_region[reg]
+    if not np.isnan(cs):
+        print(f"    Region {reg:<6} N_prov={n_:>3}  CD={cs:.3f}  p={cp:.4f}")
 print(f"  Year x region FE: FDI = {fmt(b_fdi_yrfe, p_fdi_yrfe)} (baseline {seq_fits['(4)'].params.get(LUCK,np.nan):.4f})")
 print(f"  Year x region FE: PCI = {fmt(b_pci_yrfe, p_pci_yrfe)} (baseline {seq_fits['(4)'].params.get(TALENT,np.nan):.4f})")
 
 print(f"\nTable 10. Robustness")
 for _, row in rob_df.iterrows():
-    print(f"  {row['Spec']:<26} FDI={fmt(row['FDI_b'], row['FDI_p']):>10} "
+    print(f"  {row['Spec']:<32} FDI={fmt(row['FDI_b'], row['FDI_p']):>10} "
           f"PCI={fmt(row['PCI_b'], row['PCI_p']):>10}  adj-R2={row['R2']:.4f}  N={int(row['N'])}")
 
 print(f"\nTable 11. Diagnostics")
@@ -679,7 +752,7 @@ print(f"  Wu-Hausman (FDI)      = p={p_vhat:.4f}")
 print(f"  IV first-stage F      = {F_fs:.2f}")
 print(f"  Sargan-Hansen J       = p={j_pval:.4f}")
 print(f"  FDI x PCI interaction = beta={int_b:.4f}, p={int_p:.4f}")
-print(f"  Coastal x PCI (H4)    = beta={b_cxp:.4f}, p={p_cxp:.4f}")
+print(f"  Coastal x PCI (H4)    = beta={b_cxp:.4f}, p={p_cxp:.4f}, 95% CI [{ci_cxp_low:.4f}, {ci_cxp_high:.4f}]")
 print(f"  Mundlak joint test    = F={F_mund:.2f}, p={p_mund:.4f}")
 
 
@@ -775,7 +848,8 @@ with pd.ExcelWriter('replication_tables.xlsx', engine='openpyxl') as writer:
 
     pd.DataFrame([
         {'Term': 'PCI (inland, main effect)', 'beta': b_pci_inland_implied, 'p': p_pci_int1},
-        {'Term': 'Coastal x PCI (differential)', 'beta': b_cxp, 'p': p_cxp},
+        {'Term': 'Coastal x PCI (differential)', 'beta': b_cxp, 'p': p_cxp,
+         'CI_low': ci_cxp_low, 'CI_high': ci_cxp_high},
         {'Term': 'Implied PCI (coastal)', 'beta': b_pci_coastal_implied, 'p': None},
         {'Term': 'N', 'beta': int(m_int1.nobs), 'p': None},
     ]).to_excel(writer, sheet_name='T8_H4_Interaction', index=False)
@@ -807,4 +881,8 @@ print(f"\nDone. N={N_obs}, {N_prov} provinces, {N_yr} years.")
 print(f"FDI beta (OLS) = {seq_fits['(4)'].params.get(LUCK,np.nan):.4f}, "
       f"PCI beta (OLS) = {seq_fits['(4)'].params.get(TALENT,np.nan):.4f}")
 print(f"Luck share = {pct_l:.1f}%, Talent share = {pct_t:.1f}%")
-print(f"H4 (coastal x PCI) = {b_cxp:.4f}, p = {p_cxp:.4f}")
+print(f"H4 (coastal x PCI) = {b_cxp:.4f}, p = {p_cxp:.4f}, 95% CI [{ci_cxp_low:.4f}, {ci_cxp_high:.4f}]")
+print(f"R8 (excl. NetMig/Enterprises): FDI={fmt(rob_df.loc[rob_df.Spec.str.contains('R8'),'FDI_b'].values[0], rob_df.loc[rob_df.Spec.str.contains('R8'),'FDI_p'].values[0])}, "
+      f"PCI={fmt(rob_df.loc[rob_df.Spec.str.contains('R8'),'PCI_b'].values[0], rob_df.loc[rob_df.Spec.str.contains('R8'),'PCI_p'].values[0])}")
+print(f"R9 (excl. 2020-2021): FDI={fmt(rob_df.loc[rob_df.Spec.str.contains('R9'),'FDI_b'].values[0], rob_df.loc[rob_df.Spec.str.contains('R9'),'FDI_p'].values[0])}, "
+      f"PCI={fmt(rob_df.loc[rob_df.Spec.str.contains('R9'),'PCI_b'].values[0], rob_df.loc[rob_df.Spec.str.contains('R9'),'PCI_p'].values[0])}")
